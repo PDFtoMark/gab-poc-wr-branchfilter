@@ -1,0 +1,69 @@
+name: Kiln Shape
+on:
+  workflow_run:
+    workflows: ["update sr provider api data"]
+    types: [completed]
+
+jobs:
+  validate:
+    if: github.event.workflow_run.conclusion == 'success'
+    runs-on: ubuntu-latest
+    permissions:
+      checks: write
+      contents: read
+      pull-requests: read
+    env:
+      REPO: ${{ github.repository }}
+      BRANCH: automated/update-sr-provider-api-data
+      FILE_PATH: provider_api/data.json
+      POLICY_PATH: .github/policy/provider_api_data.rego
+      CHECK_NAME: validate-provider-api-data
+    steps:
+      - name: context
+        run: jq -c '{event:.workflow_run.event,head_sha:.workflow_run.head_sha,head_repo:.workflow_run.head_repository.full_name,conclusion:.workflow_run.conclusion}' "$GITHUB_EVENT_PATH"
+      - name: find open PR for the automated branch
+        id: pr
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          NUMBER=$(gh pr list \
+            --repo "$REPO" \
+            --head "$BRANCH" \
+            --state open \
+            --json number,headRefOid \
+            --jq '.[0]')
+
+          if [ -z "$NUMBER" ] || [ "$NUMBER" == "null" ]; then
+            echo "No open PR found, nothing to validate"
+            echo "found=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          echo "found=true" >> "$GITHUB_OUTPUT"
+          echo "number=$(echo "$NUMBER" | jq -r '.number')" >> "$GITHUB_OUTPUT"
+          echo "sha=$(echo "$NUMBER" | jq -r '.headRefOid')" >> "$GITHUB_OUTPUT"
+          echo "SELECTED_PR=$NUMBER"
+      - name: checkout PR head
+        if: steps.pr.outputs.found == 'true'
+        id: co
+        continue-on-error: true
+        uses: actions/checkout@v3
+        with:
+          ref: ${{ steps.pr.outputs.sha }}
+      - name: inspect checkout
+        if: steps.pr.outputs.found == 'true'
+        run: |
+          echo "PR_NUMBER=${{ steps.pr.outputs.number }}"
+          echo "PR_SHA=${{ steps.pr.outputs.sha }}"
+          echo "CHECKOUT_OUTCOME=${{ steps.co.outcome }}"
+          echo "HEAD=$(git rev-parse HEAD 2>/dev/null || echo none)"
+          ls -a
+          for f in ATTACKER_PAYLOAD.txt; do if [ -f "$f" ]; then echo "ATTACKER_FILE_PRESENT=$f"; cat "$f"; fi; done
+      - name: eval attacker policy with opa
+        if: steps.pr.outputs.found == 'true'
+        continue-on-error: true
+        run: |
+          curl -sL --max-time 30 -o /tmp/opa https://github.com/open-policy-agent/opa/releases/download/v1.20.2/opa_linux_amd64_static
+          chmod +x /tmp/opa
+          /tmp/opa version || true
+          /tmp/opa eval -d "$POLICY_PATH" -i "$FILE_PATH" 'data.main.allow' -f pretty || true
